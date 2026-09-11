@@ -153,6 +153,30 @@ function maskMessages(messages: any[], nameRe: RegExp): any[] {
   });
 }
 
+function textOf(m: any): string {
+  if (typeof m?.content === "string") return m.content;
+  if (Array.isArray(m?.content)) {
+    return m.content
+      .filter((p: any) => typeof p?.text === "string")
+      .map((p: any) => p.text)
+      .join("\n");
+  }
+  return "";
+}
+
+// 本轮新增：最后一条 user 消息及之后的所有消息（含工具调用/结果）。
+// 路由只判定这里，避免历史里的敏感串把路由锁死在安全模型。
+function recentMessages(messages: any[]): any[] {
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  return lastUser >= 0 ? messages.slice(lastUser) : messages.slice(-1);
+}
+
 export default function cnPiiGate(pi: any): void {
   const cfg = loadConfig();
   const nameRe = buildNameRe(cfg.names);
@@ -163,26 +187,20 @@ export default function cnPiiGate(pi: any): void {
       return undefined;
     }
 
-    // 只检测消息文本内容，避开 timestamp/model 等元数据字段误判
-    const texts: string[] = [];
-    for (const m of payload.messages) {
-      if (typeof m?.content === "string") texts.push(m.content);
-      else if (Array.isArray(m?.content)) {
-        for (const p of m.content) if (typeof p?.text === "string") texts.push(p.text);
-      }
-    }
-    const hasSensitive = texts.some((t) => hasSensitiveText(t, nameRe));
-    if (!hasSensitive) return undefined;
-
+    // 1) 全量打码：历史 + 本轮所有文本都打码，供应商永远看不到真实值
     const masked = maskMessages(payload.messages, nameRe);
     const maskedJson = JSON.stringify(masked);
 
-    // 1) 总是打码
+    // 2) 路由判定只看本轮新增内容（最后一条 user 消息及之后）
+    const hasSensitive = recentMessages(payload.messages).some((m) =>
+      hasSensitiveText(textOf(m), nameRe),
+    );
+
     let out: any = { ...payload, messages: masked };
 
-    // 2) 自动路由（可选）：当前模型不是安全模型时，切到安全模型
+    // 自动路由（可选）：本轮新增有敏感且当前模型不是安全模型时，切到安全模型
     const currentModel = String(payload?.model ?? "");
-    if (cfg.routeEnabled && !currentModel.startsWith("doubao-")) {
+    if (cfg.routeEnabled && hasSensitive && !currentModel.startsWith("doubao-")) {
       out = { ...out, model: cfg.safeModel };
       console.error(
         `⚑ [cn-pii-gate] 检测到敏感信息，本次请求已自动路由 ${currentModel} → ${cfg.safeModel}（安全模型）`,
