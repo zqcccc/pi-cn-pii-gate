@@ -71,10 +71,14 @@ const MASK = {
 };
 
 // 中国手机号：1[3-9] 开头 + 9 位数字，前后不能是数字（避免截断 18 位身份证）
-const PHONE_RE = /(?<!\d)1[3-9]\d{9}(?!\d)/g;
+// 无 /g：避免模块级共享正则 lastIndex 状态污染
+const PHONE_RE = /(?<!\d)1[3-9]\d{9}(?!\d)/;
 
-// 身份证号：18 位，17 位数字 + 末位数字或 X/x
-const ID_RE = /(?<!\d)(?:\d{17}[\dXx])(?!\d)/g;
+// 身份证号：18 位，17 位数字 + 末位数字或 X/x（无 /g）
+const ID_RE = /(?<!\d)(?:\d{17}[\dXx])(?!\d)/;
+
+// 银行卡号候选：13-19 位连续数字（仅用于 match 提取）
+const CARD_CANDIDATE_RE = /(?<!\d)\d{13,19}(?!\d)/g;
 
 // Luhn 校验（银行卡识别，避免误伤订单号/日期串）
 function luhnValid(digits: string): boolean {
@@ -93,7 +97,19 @@ function luhnValid(digits: string): boolean {
 }
 
 function maskCard(s: string): string {
-  return s.replace(/(?<!\d)\d{13,19}(?!\d)/g, (m) => (luhnValid(m) ? MASK.card : m));
+  return s.replace(CARD_CANDIDATE_RE, (m) => (luhnValid(m) ? MASK.card : m));
+}
+
+// 检测文本中是否存在敏感内容。只检测文本本身，避免 timestamp 等元数据误判。
+// 银行卡：与 maskCard 同一标准（Luhn 通过才算），检测/打码完全一致。
+function hasSensitiveText(s: string, nameRe: RegExp): boolean {
+  if (!s) return false;
+  if (PHONE_RE.test(s)) return true;
+  if (ID_RE.test(s)) return true;
+  const candidates = s.match(CARD_CANDIDATE_RE);
+  if (candidates && candidates.some(luhnValid)) return true;
+  const nameCopy = new RegExp(nameRe.source, nameRe.flags); // 副本，避免 lastIndex 污染
+  return nameCopy.test(s);
 }
 
 // 名字匹配：拼音忽略大小写，允许 "zhao qiao chu" / "zhao-qiao-chu" 变体
@@ -106,15 +122,15 @@ function buildNameRe(names: string[]): RegExp {
     }
     return esc;
   });
-  if (parts.length === 0) return /(?!)ä/; // 永不匹配
+  if (parts.length === 0) return /(?!)a/; // 永不匹配
   return new RegExp(`(?<![\\p{L}\\p{N}])(${parts.join("|")})(?![\\p{L}\\p{N}])`, "giu");
 }
 
 function maskText(s: string, nameRe: RegExp): string {
   if (!s) return s;
   let out = s;
-  out = out.replace(PHONE_RE, MASK.phone);
-  out = out.replace(ID_RE, MASK.id);
+  out = out.replace(new RegExp(PHONE_RE.source, PHONE_RE.flags), MASK.phone);
+  out = out.replace(new RegExp(ID_RE.source, ID_RE.flags), MASK.id);
   out = maskCard(out);
   out = out.replace(nameRe, MASK.name);
   return out;
@@ -147,13 +163,15 @@ export default function cnPiiGate(pi: any): void {
       return undefined;
     }
 
-    const all = JSON.stringify(payload.messages);
-    const hasPhone = PHONE_RE.test(all);
-    const hasId = ID_RE.test(all);
-    const hasCard = /(?<!\d)\d{13,19}(?!\d)/g.test(all);
-    const hasName = nameRe.test(all);
-
-    const hasSensitive = hasPhone || hasId || hasCard || hasName;
+    // 只检测消息文本内容，避开 timestamp/model 等元数据字段误判
+    const texts: string[] = [];
+    for (const m of payload.messages) {
+      if (typeof m?.content === "string") texts.push(m.content);
+      else if (Array.isArray(m?.content)) {
+        for (const p of m.content) if (typeof p?.text === "string") texts.push(p.text);
+      }
+    }
+    const hasSensitive = texts.some((t) => hasSensitiveText(t, nameRe));
     if (!hasSensitive) return undefined;
 
     const masked = maskMessages(payload.messages, nameRe);

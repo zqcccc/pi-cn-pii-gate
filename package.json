@@ -1,6 +1,6 @@
 {
   "name": "cn-pii-gate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "中国版 PII 门控：补充检测中国手机号、身份证号、银行卡号与自定义敏感名字，发送前自动打码，并可自动路由到指定安全模型（如火山方舟）",
   "license": "MIT",
   "keywords": [
