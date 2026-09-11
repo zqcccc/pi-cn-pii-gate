@@ -136,21 +136,23 @@ function maskText(s: string, nameRe: RegExp): string {
   return out;
 }
 
+function maskMessage(m: any, nameRe: RegExp): any {
+  if (typeof m?.content === "string") {
+    return { ...m, content: maskText(m.content, nameRe) };
+  }
+  if (Array.isArray(m?.content)) {
+    return {
+      ...m,
+      content: m.content.map((p: any) =>
+        typeof p?.text === "string" ? { ...p, text: maskText(p.text, nameRe) } : p,
+      ),
+    };
+  }
+  return m;
+}
+
 function maskMessages(messages: any[], nameRe: RegExp): any[] {
-  return messages.map((m: any) => {
-    if (typeof m?.content === "string") {
-      return { ...m, content: maskText(m.content, nameRe) };
-    }
-    if (Array.isArray(m?.content)) {
-      return {
-        ...m,
-        content: m.content.map((p: any) =>
-          typeof p?.text === "string" ? { ...p, text: maskText(p.text, nameRe) } : p,
-        ),
-      };
-    }
-    return m;
-  });
+  return messages.map((m: any) => maskMessage(m, nameRe));
 }
 
 function textOf(m: any): string {
@@ -187,30 +189,34 @@ export default function cnPiiGate(pi: any): void {
       return undefined;
     }
 
-    // 1) 全量打码：历史 + 本轮所有文本都打码，供应商永远看不到真实值
-    const masked = maskMessages(payload.messages, nameRe);
-    const maskedJson = JSON.stringify(masked);
+    // 本轮新增（最后一条 user 消息及之后）—— 路由判定只看这里
+    const recent = recentMessages(payload.messages);
+    const recentStart = payload.messages.length - recent.length;
+    const hasSensitive = recent.some((m) => hasSensitiveText(textOf(m), nameRe));
 
-    // 2) 路由判定只看本轮新增内容（最后一条 user 消息及之后）
-    const hasSensitive = recentMessages(payload.messages).some((m) =>
-      hasSensitiveText(textOf(m), nameRe),
-    );
-
-    let out: any = { ...payload, messages: masked };
-
-    // 自动路由（可选）：本轮新增有敏感且当前模型不是安全模型时，切到安全模型
     const currentModel = String(payload?.model ?? "");
-    if (cfg.routeEnabled && hasSensitive && !currentModel.startsWith("doubao-")) {
-      out = { ...out, model: cfg.safeModel };
-      console.error(
-        `⚑ [cn-pii-gate] 检测到敏感信息，本次请求已自动路由 ${currentModel} → ${cfg.safeModel}（安全模型）`,
+    const safePrefix = cfg.safeModel.split(/[-:]/)[0];
+    const onSafeModel = currentModel.startsWith(safePrefix);
+
+    if (cfg.routeEnabled && hasSensitive && !onSafeModel) {
+      // 路由到可信安全模型（默认火山方舟，零留存）：
+      // 本轮新增内容保留原文，让安全模型真正能处理；历史照常打码，
+      // 防止后续请求回到不可信模型时，历史里的敏感原文泄露。
+      const routed = payload.messages.map((m: any, i: number) =>
+        i >= recentStart ? m : maskMessage(m, nameRe),
       );
+      const out: any = { ...payload, messages: routed, model: cfg.safeModel };
+      console.error(
+        `⚑ [cn-pii-gate] 检测到敏感信息，本次请求已自动路由 ${currentModel} → ${cfg.safeModel}（安全模型），本轮内容保留原文供模型处理`,
+      );
+      return out;
     }
 
-    // 内容没变化且没改模型 → 不返回（避免无意义重发）
-    if (maskedJson === JSON.stringify(payload.messages) && out.model === payload.model) {
+    // 不路由（无敏感 / 已在安全模型 / 路由关闭）：全量打码保护历史敏感内容
+    const masked = maskMessages(payload.messages, nameRe);
+    if (JSON.stringify(masked) === JSON.stringify(payload.messages)) {
       return undefined;
     }
-    return out;
+    return { ...payload, messages: masked };
   });
 }
